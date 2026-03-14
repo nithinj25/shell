@@ -3,6 +3,7 @@
 #include<stdlib.h>
 #include<stdio.h>
 #include<string.h>
+#include<fcntl.h>
 #define LSH_RL_BUFSIZE 1024
 #define LSH_TOK_BUFSIZE 64
 #define LSH_TOK_DELIM " \t\r\n\a"
@@ -11,6 +12,9 @@ int lsh_cd(char **args);
 int lsh_help(char **args);
 int lsh_exit(char **args);
 int lsh_execute(char **args);
+int lsh_launch(char **args);
+char ***lsh_split_pipeline(char *line, int *nums_cmds);
+int lsh_execute_pipline(char ***cmds, int num_cmds);
 
 char *buildin_str[] = {
     "cd",
@@ -87,6 +91,7 @@ char *lsh_read_line(void){
         //if we hvae exceeded the buffer, reallocate
         if(position >= bufsize){
             bufsize += LSH_RL_BUFSIZE;
+            buffer = realloc(buffer, sizeof(char) * bufsize);
             if(!buffer){
                 fprintf(stderr, "lsh: allocation  error\n");
                 exit(EXIT_FAILURE);
@@ -145,55 +150,175 @@ int lsh_launch(char **args){
     pid_t pid, wpid;
     int status;
 
-    //this is where i implement the > operations
+    //working on parse redirection operators
     int i = 0;
     char *output_file = NULL;
+    char *input_file  = NULL;
+    int  append_mode  = 0;
 
-    while(args[i] != NULL){
+    while( args[i] != NULL){
         if(strcmp(args[i], ">") == 0){
             output_file = args[i + 1];
-
-            if(output_file == NULL){
-                fprintf(stderr, "Syntax error, no output file specifiec\n");
-                return 1;
-            }
+            append_mode = 0;
             args[i] = NULL;
             break;
         }
-        i++; 
+        else if(strcmp(args[i], ">>") == 0){
+            output_file = args[i + 1];
+            append_mode = 1;
+            args[i] = NULL;
+            break;
+        } 
+        else if(strcmp(args[i], "<") == 0){
+            input_file = args[i + 1];
+            args[i] = NULL;
+            break;
+        }
+        i++;
     }
-
+    //start a childprocess
     pid = fork();
     if(pid == 0){
-        if(execvp(args[0], args) == -1){
-            perror("lsh");
+        //a reminder to wire up the file descriptors before calling the exec 
+
+        if(input_file != NULL){
+            int fd_in = open(input_file, O_RDONLY);
+            if(fd_in < 0) {
+                perror("lsh: open input");
+                exit(EXIT_FAILURE);
+            }
+            //replacing the stdin with file
+            //dup2 makes the child process's file descriptor 1 point to your file
+            //this means that when execvp runs the new program, it inherits those fds, so all its printf/wirte calls go to your file
+            dup2(fd_in, STDIN_FILENO);
+            close(fd_in);
         }
+
+        if(output_file != NULL){
+            int flags = O_WRONLY | O_CREAT | (append_mode ? O_APPEND : O_TRUNC);
+            //need to understand why are we using this 0644 
+            int fd_out = open(output_file, flags, 0644);
+            if(fd_out < 0) {
+                perror("lsh: open output");
+                exit(EXIT_FAILURE);
+            }
+            //REPLACING THE STDOUT WITH THE FILE
+            dup2(fd_out, STDOUT_FILENO);
+            close(fd_out);
+        }
+
+        if(execvp(args[0], args) == -1) { perror("lsh"); }
         exit(EXIT_FAILURE);
     }
     else if(pid < 0){
         perror("lsh");
-    }else{
+    }
+    else{
         do{
             wpid = waitpid(pid, &status, WUNTRACED);
-        }while(!WIFEXITED(status) && !WIFSIGNALED(status));
+        }while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    }
+    return 1;
+}
+
+//basically splitting a command line into an array of arguments arrays, split on "|"
+//e.g. "ls -l | grep foo | wc -l" → [ ["ls","-l",NULL], ["grep","foo",NULL], ["wc","-l",NULL] ]
+//the above is the best exmple to do this 
+char ***lsh_split_pipeline(char *line, int *nums_cmds){
+    //frist split on "|" to get command strings
+    char **pipe_parts = malloc(LSH_TOK_BUFSIZE * sizeof(char *));
+    int count = 0;
+
+    char *segments = strtok(line, "|");
+    while(segments != NULL){
+        pipe_parts[count++] = segments;
+        segments = strtok(NULL, "|");
+    }
+
+    //in the segments are split into arguments
+    char ***cmds = malloc(count * sizeof(char **));
+    for(int i = 0; i < count; i++){
+        cmds[i] = lsh_split_line(pipe_parts[i]);
+    }
+
+    free(pipe_parts);
+    *nums_cmds = count;
+    return cmds;
+}
+
+int lsh_execute_pipline(char ***cmds, int num_cmds){
+    if(num_cmds == 1){
+        //no pipe_fall thorugh to normal execute
+        return lsh_execute(cmds[0]);
+    }
+
+    int pipes[num_cmds - 1][2];
+
+    for(int i = 0; i < num_cmds - 1; i++){
+        if(pipe(pipes[i]) < 0){
+            perror("lsh: pipe");
+            return 1;
+        }
+    }
+
+    pid_t pids[num_cmds];
+
+    for(int i = 0; i < num_cmds; i++){
+        pids[i] = fork();
+
+        if(pids[i] == 0){
+            //child i
+
+            if(i > 0){
+                dup2(pipes[i - 1][0], STDIN_FILENO);
+            }
+
+            if(i < num_cmds - 1){
+                dup2(pipes[i][1], STDOUT_FILENO);
+            }
+
+            for(int j = 0; j < num_cmds - 1; j++){
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+
+            if(execvp(cmds[i][0], cmds[i]) == -1){
+                perror("lsh");
+            }
+            exit(EXIT_FAILURE);
+        } else if (pids[i] < 0){
+            perror("lsh: fork");
+        }
+    }
+
+    for(int i = 0; i < num_cmds - 1; i++){
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    for(int i = 0; i < num_cmds; i++){
+        int status;
+        waitpid(pids[i], &status, 0);
     }
     return 1;
 }
 
 void lsh_loop(void){
     char *line;
-    char **args;
+    int num_cmds;
     int status;
 
     do{
         printf("> ");
         line = lsh_read_line();
-        args = lsh_split_line(line);
-        status = lsh_execute(args);
 
+        char ***cmds = lsh_split_pipeline(line, &num_cmds);
+        status = lsh_execute_pipline(cmds, num_cmds);
+
+        for(int i = 0; i < num_cmds; i++) free(cmds[i]);
+        free(cmds);
         free(line);
-        free(args);
-    }while(status);
+    } while(status);
 }
 
 int main(){
@@ -201,3 +326,4 @@ int main(){
 
     return EXIT_SUCCESS;
 }
+
